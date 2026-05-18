@@ -40,9 +40,17 @@ const writeDiagnosticStabilityBundleForFailureSync = vi.fn((_reason: string, _er
 const controlUiState = vi.hoisted(() => ({
   root: "/tmp/openclaw-control-ui" as string | null,
 }));
+const netState = vi.hoisted(() => ({
+  autoBindHost: "127.0.0.1",
+  container: false,
+}));
 const withoutSupervisorEnv = Object.fromEntries(
   SUPERVISOR_HINT_ENV_VARS.map((key) => [key, undefined]),
 ) as Record<string, string | undefined>;
+const withoutGatewayAuthEnv = {
+  OPENCLAW_GATEWAY_TOKEN: undefined,
+  OPENCLAW_GATEWAY_PASSWORD: undefined,
+};
 
 const { runtimeErrors, defaultRuntime, resetRuntimeCapture } = createCliRuntimeCapture();
 
@@ -84,6 +92,35 @@ vi.mock("../../gateway/auth.js", () => ({
     };
   },
 }));
+
+vi.mock("../../gateway/net.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../gateway/net.js")>();
+  return {
+    ...actual,
+    defaultGatewayBindMode: (tailscaleMode?: string) => {
+      if (tailscaleMode && tailscaleMode !== "off") {
+        return "loopback";
+      }
+      return netState.container ? "auto" : "loopback";
+    },
+    isContainerEnvironment: () => netState.container,
+    resolveGatewayBindHost: async (bind?: string, customHost?: string) => {
+      if (bind === "auto") {
+        return netState.autoBindHost;
+      }
+      if (bind === "lan") {
+        return "0.0.0.0";
+      }
+      if (bind === "custom") {
+        return customHost?.trim() || "0.0.0.0";
+      }
+      if (bind === "tailnet") {
+        return "100.64.0.1";
+      }
+      return "127.0.0.1";
+    },
+  };
+});
 
 vi.mock("../../gateway/server.js", () => ({
   startGatewayServer: (port: number, opts?: unknown) => startGatewayServer(port, opts),
@@ -162,11 +199,13 @@ vi.mock("./run-loop.js", () => ({
 }));
 
 describe("gateway run option collisions", () => {
-  let addGatewayRunCommand: typeof import("./run.js").addGatewayRunCommand;
+  let addGatewayRunCommand: typeof import("./run-command.js").addGatewayRunCommand;
+  let validateGatewayBuiltRuntimeArtifacts: typeof import("./run.js").validateGatewayBuiltRuntimeArtifacts;
   let sharedProgram: Command;
 
   beforeAll(async () => {
-    ({ addGatewayRunCommand } = await import("./run.js"));
+    ({ addGatewayRunCommand } = await import("./run-command.js"));
+    ({ validateGatewayBuiltRuntimeArtifacts } = await import("./run.js"));
     sharedProgram = new Command();
     sharedProgram.exitOverride();
     const gateway = addGatewayRunCommand(sharedProgram.command("gateway"));
@@ -177,6 +216,8 @@ describe("gateway run option collisions", () => {
     resetRuntimeCapture();
     configState.cfg = {};
     configState.snapshot = { exists: false };
+    netState.autoBindHost = "127.0.0.1";
+    netState.container = false;
     readBestEffortConfig.mockClear();
     readConfigFileSnapshotWithPluginMetadata.mockClear();
     controlUiState.root = "/tmp/openclaw-control-ui";
@@ -295,13 +336,65 @@ describe("gateway run option collisions", () => {
   });
 
   it("starts gateway when token mode has no configured token (startup bootstrap path)", async () => {
-    await runGatewayCli(["gateway", "run", "--allow-unconfigured"]);
+    await withEnvAsync(withoutGatewayAuthEnv, async () => {
+      await runGatewayCli(["gateway", "run", "--allow-unconfigured"]);
+    });
 
     expect(readConfigFileSnapshotWithPluginMetadata).toHaveBeenCalledTimes(1);
     expect(readBestEffortConfig).not.toHaveBeenCalled();
     const options = gatewayStartOptions();
     expect(options.bind).toBe("loopback");
     expect(options.startupConfigSnapshotRead).toEqual({ snapshot: configState.snapshot });
+  });
+
+  it("allows authless auto startup when it resolves to loopback", async () => {
+    await withEnvAsync(withoutGatewayAuthEnv, async () => {
+      await runGatewayCli(["gateway", "run", "--bind", "auto", "--allow-unconfigured"]);
+    });
+
+    const options = gatewayStartOptions();
+    expect(options.bind).toBe("auto");
+  });
+
+  it("blocks container auto startup without explicit gateway auth", async () => {
+    netState.autoBindHost = "0.0.0.0";
+    netState.container = true;
+
+    await withEnvAsync(withoutGatewayAuthEnv, async () => {
+      await expect(runGatewayCli(["gateway", "run", "--allow-unconfigured"])).rejects.toThrow(
+        "__exit__:78",
+      );
+    });
+
+    expect(runtimeErrors.join("\n")).toContain("Refusing to bind gateway to auto without auth.");
+    expect(startGatewayServer).not.toHaveBeenCalled();
+  });
+
+  it("blocks non-loopback startup without explicit gateway auth", async () => {
+    await withEnvAsync(withoutGatewayAuthEnv, async () => {
+      await expect(
+        runGatewayCli(["gateway", "run", "--bind", "lan", "--allow-unconfigured"]),
+      ).rejects.toThrow("__exit__:78");
+    });
+
+    expect(runtimeErrors.join("\n")).toContain("Refusing to bind gateway to lan without auth.");
+    expect(startGatewayServer).not.toHaveBeenCalled();
+  });
+
+  it("allows non-loopback startup when token auth is explicit", async () => {
+    await runGatewayCli([
+      "gateway",
+      "run",
+      "--bind",
+      "lan",
+      "--token",
+      "tok_run",
+      "--allow-unconfigured",
+    ]);
+
+    const options = gatewayStartOptions();
+    expect(options.bind).toBe("lan");
+    expect(options.auth?.token).toBe("tok_run");
   });
 
   it("uses the startup snapshot only for the first in-process gateway start", async () => {
@@ -329,6 +422,37 @@ describe("gateway run option collisions", () => {
     expect(gatewayLogMessages).toContain(
       "Control UI assets are missing; first startup may spend a few seconds building them before the gateway binds. `pnpm gateway:watch` does not rebuild Control UI assets, so rerun `pnpm ui:build` after UI changes or use `pnpm ui:dev` while developing the Control UI. For a full local dist, run `pnpm build && pnpm ui:build`.",
     );
+  });
+
+  it("skips built-runtime preflight outside dist entrypoints", async () => {
+    await expect(
+      validateGatewayBuiltRuntimeArtifacts({
+        importerUrl: "file:///tmp/openclaw/src/cli/gateway-cli/run.ts",
+        importModule: vi.fn(async () => {
+          throw new Error("should not load");
+        }),
+      }),
+    ).resolves.toEqual([]);
+  });
+
+  it("reports actionable built-runtime preflight failures", async () => {
+    const importModule = vi.fn(async (specifier: string) => {
+      if (specifier.endsWith("/auto-reply/reply/dispatch-from-config.js")) {
+        throw new Error("Cannot find module '/tmp/openclaw/dist/origin-routing-abc.js'");
+      }
+      return {};
+    });
+
+    const errors = await validateGatewayBuiltRuntimeArtifacts({
+      importerUrl: "file:///tmp/openclaw/dist/cli/gateway-cli/run.js",
+      importModule,
+    });
+
+    expect(importModule).toHaveBeenCalledTimes(3);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("Gateway start blocked: built runtime artifact check failed");
+    expect(errors[0]).toContain("auto-reply/reply/dispatch-from-config.js");
+    expect(errors[0]).toContain("pnpm build");
   });
 
   it("does not write startup failure bundles for expected gateway lock conflicts", async () => {

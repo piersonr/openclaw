@@ -15,6 +15,7 @@ type DoctorConfigResult = {
   sourceConfigValid?: boolean;
   sourceLastTouchedVersion?: string;
   skipPluginValidationOnWrite?: boolean;
+  preservedLegacyRootKeys?: readonly string[];
 };
 
 type DoctorHealthFlowContext = {
@@ -227,6 +228,34 @@ async function runCommandOwnerHealth(ctx: DoctorHealthFlowContext): Promise<void
   noteCommandOwnerHealth(ctx.cfg);
 }
 
+async function runStructuredHealthRepairs(ctx: DoctorHealthFlowContext): Promise<void> {
+  if (!ctx.prompter.shouldRepair) {
+    return;
+  }
+  const { registerCoreHealthChecks } = await import("./doctor-core-checks.js");
+  const { runDoctorHealthRepairs } = await import("./doctor-repair-flow.js");
+  const { resolveAgentWorkspaceDir, resolveDefaultAgentId } =
+    await import("../agents/agent-scope.js");
+  const { note } = await import("../terminal/note.js");
+
+  registerCoreHealthChecks();
+  const workspaceDir = resolveAgentWorkspaceDir(ctx.cfg, resolveDefaultAgentId(ctx.cfg));
+  const result = await runDoctorHealthRepairs({
+    mode: "fix",
+    runtime: ctx.runtime,
+    cfg: ctx.cfg,
+    cwd: workspaceDir,
+    configPath: ctx.configPath,
+  });
+  ctx.cfg = result.config;
+  if (result.changes.length > 0) {
+    note(result.changes.join("\n"), "Doctor changes");
+  }
+  if (result.warnings.length > 0) {
+    note(result.warnings.join("\n"), "Doctor warnings");
+  }
+}
+
 async function runClaudeCliHealth(ctx: DoctorHealthFlowContext): Promise<void> {
   const { noteClaudeCliHealth } = await import("../commands/doctor-claude-cli.js");
   noteClaudeCliHealth(ctx.cfg);
@@ -343,12 +372,21 @@ async function runCodexSessionRouteHealth(ctx: DoctorHealthFlowContext): Promise
 
 async function runSessionLocksHealth(ctx: DoctorHealthFlowContext): Promise<void> {
   const { noteSessionLockHealth } = await import("../commands/doctor-session-locks.js");
-  await noteSessionLockHealth({ shouldRepair: ctx.prompter.shouldRepair });
+  await noteSessionLockHealth({
+    shouldRepair: ctx.prompter.shouldRepair,
+    config: ctx.cfg,
+    env: ctx.env,
+  });
 }
 
 async function runSessionTranscriptsHealth(ctx: DoctorHealthFlowContext): Promise<void> {
   const { noteSessionTranscriptHealth } = await import("../commands/doctor-session-transcripts.js");
   await noteSessionTranscriptHealth({ shouldRepair: ctx.prompter.shouldRepair });
+}
+
+async function runSessionSnapshotsHealth(ctx: DoctorHealthFlowContext): Promise<void> {
+  const { noteSessionSnapshotHealth } = await import("../commands/doctor-session-snapshots.js");
+  await noteSessionSnapshotHealth({ cfg: ctx.cfg, env: ctx.env ?? process.env });
 }
 
 async function runConfigAuditScrubHealth(ctx: DoctorHealthFlowContext): Promise<void> {
@@ -619,6 +657,7 @@ async function runWriteConfigHealth(ctx: DoctorHealthFlowContext): Promise<void>
         allowConfigSizeDrop: ctx.configResult.shouldWriteConfig === true || updateDoctorRun,
         skipPluginValidation:
           ctx.configResult.skipPluginValidationOnWrite === true || updateDoctorRun,
+        preservedLegacyRootKeys: ctx.configResult.preservedLegacyRootKeys,
       },
     });
     logConfigUpdated(ctx.runtime);
@@ -660,6 +699,7 @@ async function runFinalConfigValidationHealth(ctx: DoctorHealthFlowContext): Pro
   const { readConfigFileSnapshot } = await import("../config/config.js");
   const finalSnapshot = await readConfigFileSnapshot({
     skipPluginValidation: isUpdateDoctorRun(ctx.env ?? process.env),
+    preservedLegacyRootKeys: ctx.configResult.preservedLegacyRootKeys,
   });
   if (finalSnapshot.exists && !finalSnapshot.valid) {
     ctx.runtime.error("Invalid config:");
@@ -696,6 +736,11 @@ export function resolveDoctorHealthContributions(): DoctorHealthContribution[] {
       id: "doctor:command-owner",
       label: "Command owner",
       run: runCommandOwnerHealth,
+    }),
+    createDoctorHealthContribution({
+      id: "doctor:structured-health-repairs",
+      label: "Structured health repairs",
+      run: runStructuredHealthRepairs,
     }),
     createDoctorHealthContribution({
       id: "doctor:legacy-state",
@@ -736,6 +781,11 @@ export function resolveDoctorHealthContributions(): DoctorHealthContribution[] {
       id: "doctor:session-transcripts",
       label: "Session transcripts",
       run: runSessionTranscriptsHealth,
+    }),
+    createDoctorHealthContribution({
+      id: "doctor:session-snapshots",
+      label: "Session snapshots",
+      run: runSessionSnapshotsHealth,
     }),
     createDoctorHealthContribution({
       id: "doctor:config-audit-scrub",
