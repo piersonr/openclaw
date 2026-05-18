@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import { request } from "node:http";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Command } from "commander";
 import type {
   ConfigFileSnapshot,
@@ -94,6 +95,20 @@ const GATEWAY_RUN_BOOLEAN_KEYS = [
 const SUPERVISED_GATEWAY_LOCK_RETRY_MS = 5000;
 const SUPERVISED_GATEWAY_LOCK_RETRY_TIMEOUT_MS = 30_000;
 const SUPERVISED_GATEWAY_HEALTH_PROBE_TIMEOUT_MS = 1000;
+const GATEWAY_RUNTIME_PREFLIGHT_MODULES = [
+  {
+    label: "reply dispatch runtime",
+    relativePath: "../../auto-reply/reply/dispatch-from-config.js",
+  },
+  {
+    label: "runtime plugins facade",
+    relativePath: "../../auto-reply/reply/runtime-plugins.runtime.js",
+  },
+  {
+    label: "channel plugin loader fallback",
+    relativePath: "../../channels/plugins/read-only.js",
+  },
+] as const;
 
 type Awaitable<T> = T | Promise<T>;
 type GatewayRunLogger = Pick<ReturnType<typeof createSubsystemLogger>, "info" | "warn">;
@@ -246,6 +261,68 @@ async function maybeLogPendingControlUiBuild(cfg: OpenClawConfig): Promise<void>
   gatewayLog.info(
     "Control UI assets are missing; first startup may spend a few seconds building them before the gateway binds. `pnpm gateway:watch` does not rebuild Control UI assets, so rerun `pnpm ui:build` after UI changes or use `pnpm ui:dev` while developing the Control UI. For a full local dist, run `pnpm build && pnpm ui:build`.",
   );
+}
+
+function resolveGatewayDistRoot(importerUrl = import.meta.url): string | undefined {
+  let importerPath: string;
+  try {
+    importerPath = fileURLToPath(importerUrl);
+  } catch {
+    return undefined;
+  }
+  const distMarker = `${path.sep}dist${path.sep}`;
+  const distMarkerIndex = importerPath.lastIndexOf(distMarker);
+  if (distMarkerIndex < 0) {
+    return undefined;
+  }
+  return importerPath.slice(0, distMarkerIndex + distMarker.length - 1);
+}
+
+function shouldValidateGatewayBuiltRuntimeArtifacts(importerUrl = import.meta.url): boolean {
+  let importerPath: string;
+  try {
+    importerPath = fileURLToPath(importerUrl);
+  } catch {
+    return false;
+  }
+  const expectedSuffix = path.join("dist", "cli", "gateway-cli", "run.js");
+  return importerPath.endsWith(expectedSuffix);
+}
+
+export async function validateGatewayBuiltRuntimeArtifacts(params?: {
+  importerUrl?: string;
+  importModule?: (specifier: string) => Promise<unknown>;
+}): Promise<string[]> {
+  const importerUrl = params?.importerUrl ?? import.meta.url;
+  if (!shouldValidateGatewayBuiltRuntimeArtifacts(importerUrl)) {
+    return [];
+  }
+  const importModule =
+    params?.importModule ?? (async (specifier: string) => await import(specifier));
+  const distRoot = resolveGatewayDistRoot(importerUrl);
+  if (!distRoot) {
+    return [];
+  }
+
+  const errors: string[] = [];
+  for (const candidate of GATEWAY_RUNTIME_PREFLIGHT_MODULES) {
+    const moduleUrl = new URL(candidate.relativePath, importerUrl);
+    try {
+      await importModule(moduleUrl.href);
+    } catch (err) {
+      const modulePath = fileURLToPath(moduleUrl);
+      const relativeModulePath = path.relative(distRoot, modulePath) || path.basename(modulePath);
+      errors.push(
+        [
+          `Gateway start blocked: built runtime artifact check failed for ${candidate.label}.`,
+          `Missing or broken module: ${relativeModulePath}`,
+          formatErrorMessage(err),
+          "Rebuild with `pnpm build` and restart the gateway.",
+        ].join(" "),
+      );
+    }
+  }
+  return errors;
 }
 
 function getGatewayStartGuardErrors(params: {
@@ -689,6 +766,14 @@ export async function runGatewayCommand(opts: GatewayRunOpts) {
   });
   if (guardErrors.length > 0) {
     for (const error of guardErrors) {
+      defaultRuntime.error(error);
+    }
+    defaultRuntime.exit(EXIT_CONFIG_ERROR);
+    return;
+  }
+  const runtimeArtifactErrors = await validateGatewayBuiltRuntimeArtifacts();
+  if (runtimeArtifactErrors.length > 0) {
+    for (const error of runtimeArtifactErrors) {
       defaultRuntime.error(error);
     }
     defaultRuntime.exit(EXIT_CONFIG_ERROR);
